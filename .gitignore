@@ -1,0 +1,21 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Coverage
+/coverage/
+/lcov.info
+/*.profraw
+default_*.profraw
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local config (keep example)
+/config.toml
+.env
+.env.*
+!.env.example

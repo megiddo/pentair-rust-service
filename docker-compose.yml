@@ -1,0 +1,14 @@
+services:
+  pentairservice-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    volumes:
+      # Host source → container workspace (edit on host; build/run in container)
+      - ./:/workspace
+    ports:
+      - "8080:8080"
+    stdin_open: true
+    tty: true
+    command: ["bash"]

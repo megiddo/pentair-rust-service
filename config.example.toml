@@ -1,0 +1,13 @@
+# Example config for pentairservice (B0).
+# Copy to config.toml or point PENTAIR_CONFIG at a path.
+# Leave transport_url empty/unset to idle without opening a transport.
+
+# Bind address for the local HTTP API
+bind_addr = "0.0.0.0:8080"
+
+# Optional transport: "tcp://host:port" or a serial device path (e.g. "/dev/ttyUSB0").
+# Empty / omitted → service starts and serves /health without connecting.
+# transport_url = "tcp://192.168.1.50:8899"
+
+# Log level filter (also overridable via RUST_LOG)
+# log_level = "info"
