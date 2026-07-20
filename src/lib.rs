@@ -1,13 +1,14 @@
 //! Library root for `pentairservice`.
 //!
 //! Pattern: **Facade** — this crate is the application façade over config, logging,
-//! and the local HTTP API. Later milestones add transport/framer behind this surface
-//! without changing callers of [`run`] / [`build_router`].
+//! framing, and the local HTTP API. Transport reconnect (B2) plugs in behind this
+//! surface without changing callers of [`run`] / [`build_router`].
 
 #![deny(missing_docs)]
 
 pub mod api;
 pub mod config;
+pub mod framer;
 pub mod logging;
 
 use std::net::SocketAddr;

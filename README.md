@@ -59,10 +59,12 @@ Defaults: bind `0.0.0.0:8080`, no transport. With an empty/unset `transport_url`
 | `src/lib.rs` | Application façade (`run`, `build_router`) | Facade |
 | `src/main.rs` | Thin binary entry | Facade |
 | `src/config.rs` | Settings load (file + env) | Builder / Configuration Object |
+| `src/framer.rs` | Streaming A5 + IntelliChlor sync/seek | Parser / State Machine |
 | `src/logging.rs` | Tracing subscriber init | Facade |
 | `src/api/` | Local HTTP surface | Facade |
 | `src/api/health.rs` | `GET /health` | Facade (API surface) |
+| `fixtures/` | Copied sample hex for container-local framer tests | — |
 
 ## Milestone
 
-Track B **B0** bootstrap only. Framing, transport reconnect, and status decode land in later milestones.
+Track B **B1** streaming framer (on B0). Transport reconnect is B2; status decode is B3.
