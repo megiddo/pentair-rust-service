@@ -85,7 +85,7 @@ impl Config {
 
     /// Returns true when a non-empty transport URL is configured.
     ///
-    /// B0 does not open the transport even when this is true; B2 will.
+    /// When true, [`crate::run`] spawns the bus Actor (B2) to own the connection.
     pub fn has_transport(&self) -> bool {
         self.transport_url
             .as_ref()

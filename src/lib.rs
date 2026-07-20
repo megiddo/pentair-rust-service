@@ -1,8 +1,7 @@
 //! Library root for `pentairservice`.
 //!
 //! Pattern: **Facade** — this crate is the application façade over config, logging,
-//! framing, and the local HTTP API. Transport reconnect (B2) plugs in behind this
-//! surface without changing callers of [`run`] / [`build_router`].
+//! framing, transport Actor, and the local HTTP API.
 
 #![deny(missing_docs)]
 
@@ -10,18 +9,21 @@ pub mod api;
 pub mod config;
 pub mod framer;
 pub mod logging;
+pub mod transport;
 
 use std::net::SocketAddr;
 
 use axum::Router;
 use tokio::net::TcpListener;
-use tracing::info;
+use tokio::sync::watch;
+use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::transport::actor::{spawn_from_url, BusActorConfig};
 
-/// Logs whether a transport URL is present without opening a connection (B0).
+/// Logs whether a transport URL is present (idle vs Actor will own the bus).
 ///
-/// Pattern: **Facade** helper — keeps bus lifecycle out of the HTTP start path.
+/// Pattern: **Facade** helper — keeps messaging out of the HTTP start path.
 pub fn log_transport_idle_state(config: &Config) {
     match config
         .transport_url
@@ -31,18 +33,19 @@ pub fn log_transport_idle_state(config: &Config) {
     {
         Some(url) => info!(
             transport_url = %url,
-            "transport configured but not opened in B0 (idle until B2)"
+            "transport configured; bus Actor will own a persistent connection"
         ),
         None => info!("no transport_url configured; idling without bus connection"),
     }
 }
 
-/// Runs the service: bind the local API and serve until the listener fails.
+/// Runs the service: optional bus Actor + local API until the listener fails.
 ///
-/// Does **not** open a transport connection. An empty/unset `transport_url` keeps
-/// the process idle with only HTTP health available (B0).
+/// When `transport_url` is set, a **single** tokio task owns the socket/port,
+/// feeds the streaming framer, and reconnects with backoff — never open/close
+/// per frame.
 ///
-/// Pattern: **Facade** — single entry that composes config + API server.
+/// Pattern: **Facade** — single entry that composes config + transport Actor + API.
 pub async fn run(config: Config) -> Result<(), std::io::Error> {
     let addr: SocketAddr = config
         .bind_addr
@@ -51,11 +54,58 @@ pub async fn run(config: Config) -> Result<(), std::io::Error> {
 
     log_transport_idle_state(&config);
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bus = spawn_bus_if_configured(&config, shutdown_rx);
+
     let app = build_router();
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     info!(%local, "listening");
-    axum::serve(listener, app).await
+
+    let serve_result = axum::serve(listener, app).await;
+
+    let _ = shutdown_tx.send(true);
+    if let Some(handle) = bus {
+        match handle.await {
+            Ok(stats) => info!(
+                connects = stats.connects,
+                reconnects = stats.reconnects,
+                frames = stats.frames,
+                bytes = stats.bytes_read,
+                "bus Actor finished"
+            ),
+            Err(e) => warn!(error = %e, "bus Actor join error"),
+        }
+    }
+
+    serve_result
+}
+
+/// Spawns the bus Actor when a non-empty transport URL is configured.
+fn spawn_bus_if_configured(
+    config: &Config,
+    shutdown: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<crate::transport::BusStats>> {
+    let url = config
+        .transport_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())?;
+
+    match spawn_from_url(url, BusActorConfig::default(), shutdown) {
+        Ok((handle, _counters)) => {
+            info!(transport_url = %url, "bus Actor spawned");
+            Some(handle)
+        }
+        Err(e) => {
+            warn!(
+                transport_url = %url,
+                error = %e,
+                "failed to create transport; HTTP will still serve /health"
+            );
+            None
+        }
+    }
 }
 
 /// Builds the Axum router for the local HTTP API.
@@ -124,12 +174,50 @@ mod tests {
 
         let handle = tokio::spawn(async move { run(cfg).await });
 
-        // Retry until the server accepts connections.
         let client = reqwest_get_health(&addr).await;
         assert_eq!(client, r#"{"status":"ok"}"#);
 
         handle.abort();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn run_with_replay_transport_spawns_actor() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cfg = Config {
+            bind_addr: addr.to_string(),
+            transport_url: Some("replay:fixtures/status_temps.hex".into()),
+            log_level: "info".into(),
+        };
+
+        let handle = tokio::spawn(async move { run(cfg).await });
+        let body = reqwest_get_health(&addr).await;
+        assert_eq!(body, r#"{"status":"ok"}"#);
+        // Give the Actor a moment to open the replay fixture.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn spawn_bus_invalid_url_still_ok() {
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".into(),
+            transport_url: Some("http://not-supported".into()),
+            log_level: "info".into(),
+        };
+        let (_tx, rx) = watch::channel(false);
+        assert!(spawn_bus_if_configured(&cfg, rx).is_none());
+    }
+
+    #[test]
+    fn spawn_bus_none_without_url() {
+        let cfg = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        assert!(spawn_bus_if_configured(&cfg, rx).is_none());
     }
 
     async fn reqwest_get_health(addr: &SocketAddr) -> String {
@@ -140,7 +228,6 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        // Fallback: exercise router directly if bind race fails oddly.
         let app = build_router();
         let response = app
             .oneshot(

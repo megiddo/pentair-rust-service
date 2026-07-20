@@ -2,7 +2,7 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl build-essential pkg-config \
+    ca-certificates curl build-essential pkg-config libudev-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Pin a stable Rust channel for reproducible CI/agent runs

@@ -1,11 +1,15 @@
-# Example config for pentairservice (B0).
+# Example config for pentairservice (B2).
 # Copy to config.toml or point PENTAIR_CONFIG at a path.
 # Leave transport_url empty/unset to idle without opening a transport.
 
 # Bind address for the local HTTP API
 bind_addr = "0.0.0.0:8080"
 
-# Optional transport: "tcp://host:port" or a serial device path (e.g. "/dev/ttyUSB0").
+# Transport Strategy URL (owned by a single bus Actor task; persistent connection):
+#   tcp://192.168.1.50:8899          — EW11 / TCP bridge
+#   /dev/ttyUSB0                     — serial (default baud 9600)
+#   serial:/dev/ttyUSB0?baud=9600    — serial with baud
+#   replay:fixtures/status_temps.hex — recorded fixture (lab / tests)
 # Empty / omitted → service starts and serves /health without connecting.
 # transport_url = "tcp://192.168.1.50:8899"
 
