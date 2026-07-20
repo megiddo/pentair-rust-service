@@ -129,15 +129,37 @@ Patterns: **Command** (craft), **Mutex/Gate**, **Actor** owns TX when enabled.
 
 PHP `fromJson` re-parses from `command` + `raw`; typed fields are for status clients.
 
-### Transport URL schemes (B2)
+### Transport URL schemes (B2 / E0)
+
+Canonical forms (same mental model as snoop/PHP when those catch up):
 
 | URL | Backend |
 |-----|---------|
 | `tcp://host:port` | Async TCP client (EW11 / RS485↔TCP bridge) |
-| `/dev/ttyUSB0` or `serial:/dev/ttyUSB0?baud=9600` | Async serial |
+| `/dev/ttyPentair` or `/dev/ttyUSB0` | Async serial, default **9600 8N1** |
+| `serial:/dev/ttyPentair?baud=9600` | Async serial with explicit baud |
 | `replay:fixtures/status_temps.hex` | Recorded hex replay (tests / lab without live bus) |
 
+Examples:
+
+```bash
+# EW11
+export PENTAIR_TRANSPORT_URL=tcp://10.0.0.11:8899
+
+# Pi RS-485 (stable udev name — see docs/rpi-ops.md)
+export PENTAIR_TRANSPORT_URL=/dev/ttyPentair
+# or: export PENTAIR_TRANSPORT_URL='serial:/dev/ttyPentair?baud=9600'
+```
+
 A **single tokio task (Actor)** owns the connection: connect once, stream bytes into the framer buffer, reconnect with exponential backoff + jitter on failure. Framed messages are decoded via an explicit command-byte registry into the in-memory snapshot. The connection is **never** torn down per frame (unlike PHP `PentairComFacade`).
+
+### Raspberry Pi / ops (E4)
+
+Deploy on a Pi to either EW11 or USB-RS485 using **config only**. Full runbook:
+
+- **[`docs/rpi-ops.md`](docs/rpi-ops.md)** — udev → `/dev/ttyPentair`, `dialout`, systemd `SupplementaryGroups`, host systemd vs Docker `--device=` tradeoffs, example `config.toml` / env for `tcp://` and serial.
+- **Debian Docker** remains build/test/coverage canonical; live tty is lab/Pi only ([`06` plan](../agents/plans/06-pentairservice-docker-dev.md) in the parent tree when checked out together).
+- Optional E5 lab template (fill on real hardware only): [`docs/lab-e5-NOTES.md`](docs/lab-e5-NOTES.md).
 
 ## Recorded replay (automated soak)
 
@@ -176,7 +198,7 @@ docker compose run --rm --network=host \
 ```
 
 3. Leave the process running ≥1 hour. Watch structured logs for `bus connected`, `bus session ended; will reconnect`, and reconnect counts. Kill/restart the EW11 (or unplug Ethernet briefly) and confirm the Actor reconnects without restarting the service.
-4. Serial lab: pass the device into the container, e.g. `--device=/dev/ttyUSB0` and `PENTAIR_TRANSPORT_URL=/dev/ttyUSB0`.
+4. Serial lab: prefer host systemd on the Pi for production serial ([`docs/rpi-ops.md`](docs/rpi-ops.md)). For a short container soak, pass the device through, e.g. `--device=/dev/ttyPentair` and `PENTAIR_TRANSPORT_URL=/dev/ttyPentair`.
 
 ## Layout
 
@@ -199,7 +221,9 @@ docker compose run --rm --network=host \
 | `src/api/status.rs` | `GET /status`, `GET /frames` | Facade (API surface) |
 | `src/api/command.rs` | `POST /command` write gate | Facade (API surface) |
 | `fixtures/` | Hex samples for framer + replay + ACK tests | — |
+| `docs/rpi-ops.md` | RPi udev / dialout / systemd vs Docker | Runbook |
+| `docs/lab-e5-NOTES.md` | Optional dual-mode lab proof template (E5) | — |
 
 ## Milestone
 
-Track B **B5** write gate (final Track B milestone; stacked on B4 journal).
+Track E **E4** RPi/ops docs (stacked on B5 write gate). Track B **B5** remains the last functional Track B milestone.
