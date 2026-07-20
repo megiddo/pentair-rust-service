@@ -4,20 +4,26 @@
 //! the library façade.
 
 pub mod health;
+pub mod status;
 
 use axum::Router;
 
-/// Builds the HTTP router for the local API.
-pub fn router() -> Router {
-    Router::new().merge(health::routes())
+use crate::state::SharedBusState;
+
+/// Builds the HTTP router for the local API (`/health`, `/status`, `/frames`).
+pub fn router(state: SharedBusState) -> Router {
+    Router::new()
+        .merge(health::routes())
+        .merge(status::routes(state))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::shared_bus_state;
 
     #[test]
     fn router_builds() {
-        let _r = router();
+        let _r = router(shared_bus_state());
     }
 }

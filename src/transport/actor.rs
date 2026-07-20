@@ -13,6 +13,8 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::framer::{Frame, Framer};
+use crate::registry::MessageRegistry;
+use crate::state::{spawn_decode_drain, SharedBusState};
 
 use super::backoff::{Backoff, BackoffConfig};
 use super::{ByteTransport, TransportError};
@@ -333,7 +335,7 @@ enum SessionEnd {
     Error(TransportError),
 }
 
-/// Spawns a fire-and-forget frame drain task (B2: log/count only; B3 adds `/status`).
+/// Spawns a fire-and-forget frame drain that only counts (tests without shared state).
 pub fn spawn_frame_drain(mut rx: mpsc::Receiver<Frame>) -> tokio::task::JoinHandle<u64> {
     tokio::spawn(async move {
         let mut n = 0u64;
@@ -342,24 +344,26 @@ pub fn spawn_frame_drain(mut rx: mpsc::Receiver<Frame>) -> tokio::task::JoinHand
             debug!(
                 kind = ?frame.kind,
                 checksum_ok = frame.checksum_ok,
-                "drained frame (no status API until B3)"
+                "drained frame (count-only)"
             );
         }
         n
     })
 }
 
-/// Convenience: build actor from URL and spawn with default channel capacity.
+/// Convenience: build actor from URL, decode into shared state, spawn Actor.
 pub fn spawn_from_url(
     url: &str,
     config: BusActorConfig,
     shutdown: watch::Receiver<bool>,
+    state: SharedBusState,
+    registry: MessageRegistry,
 ) -> Result<(tokio::task::JoinHandle<BusStats>, Arc<BusCounters>), TransportError> {
     let transport = super::from_url(url)?;
     let actor = BusActor::new(transport, config);
     let counters = actor.counters();
     let (tx, rx) = mpsc::channel(256);
-    let _drain = spawn_frame_drain(rx);
+    let _drain = spawn_decode_drain(rx, state, registry);
     let handle = actor.spawn(tx, shutdown);
     Ok((handle, counters))
 }
@@ -665,14 +669,30 @@ mod tests {
         let mut cfg = BusActorConfig::accelerated_for_tests();
         cfg.reconnect_on_eof = false;
         cfg.max_reconnects = Some(0);
-        let (handle, counters) =
-            spawn_from_url("replay:fixtures/status_temps.hex", cfg, shutdown_rx).unwrap();
+        let state = crate::state::shared_bus_state();
+        let (handle, counters) = spawn_from_url(
+            "replay:fixtures/status_temps.hex",
+            cfg,
+            shutdown_rx,
+            Arc::clone(&state),
+            MessageRegistry::with_defaults(),
+        )
+        .unwrap();
         assert!(
             wait_until(Duration::from_secs(2), || {
                 counters.frames.load(Ordering::Relaxed) >= 1
                     || counters.connects.load(Ordering::Relaxed) >= 1
             })
             .await
+        );
+        // Allow decode drain to apply the TempStatus frame.
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                // poll via try_read to avoid holding across await in wait_until closure
+                state.try_read().map(|g| g.temp_status.is_some()).unwrap_or(false)
+            })
+            .await,
+            "expected tempStatus from status_temps.hex replay"
         );
         let _ = shutdown_tx.send(true);
         let stats = handle.await.unwrap();

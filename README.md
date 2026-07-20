@@ -23,7 +23,7 @@ docker compose run --rm pentairservice-dev cargo test
 # Line coverage (95% gate on library code; thin binary excluded)
 docker compose run --rm pentairservice-dev cargo llvm-cov --lib --fail-under-lines 95
 
-# Run the service (health API on published port 8080)
+# Run the service (health + status API on published port 8080)
 docker compose run --rm --service-ports pentairservice-dev cargo run
 ```
 
@@ -32,6 +32,25 @@ Then from the host:
 ```bash
 curl -s http://127.0.0.1:8080/health
 # {"status":"ok"}
+
+curl -s http://127.0.0.1:8080/status
+# {"systemStatus":null,"tempStatus":null,"framesSeen":0,"quarantined":0}
+```
+
+### Replay + poll `/status`
+
+```bash
+docker compose run --rm --service-ports \
+  -e PENTAIR_TRANSPORT_URL=replay:fixtures/status_temps.hex \
+  pentairservice-dev cargo run
+```
+
+In another terminal:
+
+```bash
+curl -s http://127.0.0.1:8080/status
+# tempStatus populated (water, air, waterSet, spaSet, info, raw hex, …)
+curl -s 'http://127.0.0.1:8080/frames?limit=5'
 ```
 
 Equivalent without compose:
@@ -48,7 +67,23 @@ docker run --rm -it -v "$PWD":/workspace -w /workspace -p 8080:8080 pentairservi
 | Env | `PENTAIR_BIND_ADDR`, `PENTAIR_TRANSPORT_URL`, `PENTAIR_LOG_LEVEL`, `PENTAIR_CONFIG` |
 | TOML | `bind_addr`, `transport_url`, `log_level` (see `config.example.toml`) |
 
-Defaults: bind `0.0.0.0:8080`, no transport. With an empty/unset `transport_url`, the service **idles** and serves `GET /health` without opening TCP/serial.
+Defaults: bind `0.0.0.0:8080`, no transport. With an empty/unset `transport_url`, the service **idles** and serves `GET /health` / `/status` / `/frames` without opening TCP/serial.
+
+### HTTP API (B3)
+
+| Method | Path | Body |
+|--------|------|------|
+| `GET` | `/health` | `{"status":"ok"}` |
+| `GET` | `/status` | Latest `systemStatus` + `tempStatus` (PHP Command JSON field names) or null |
+| `GET` | `/frames?limit=` | Newest-first ring (default `limit=32`, max 128) |
+
+**JSON field names** (compatible with future PHP `Command::fromJson`):
+
+- Shared: `raw` (hex), `protocol`, `destination`, `source`, `command`, `length`
+- SystemStatus (`0x02`): `hours`, `minutes`, `circuits`, `circuitStatus` (`filterPump`, `cleanerPump`, `waterFeature`, `spaLight`, `poolLight` as `"on"`/`"off"`), `waterTemp`, `heaterTemp`, `airTemp`
+- TempStatus (`0x08`): `water`, `air`, `waterSet`, `spaSet`, `info`
+
+PHP `fromJson` re-parses from `command` + `raw`; typed fields are for status clients.
 
 ### Transport URL schemes (B2)
 
@@ -58,7 +93,7 @@ Defaults: bind `0.0.0.0:8080`, no transport. With an empty/unset `transport_url`
 | `/dev/ttyUSB0` or `serial:/dev/ttyUSB0?baud=9600` | Async serial |
 | `replay:fixtures/status_temps.hex` | Recorded hex replay (tests / lab without live bus) |
 
-A **single tokio task (Actor)** owns the connection: connect once, stream bytes into the framer buffer, reconnect with exponential backoff + jitter on failure. The connection is **never** torn down per frame (unlike PHP `PentairComFacade`).
+A **single tokio task (Actor)** owns the connection: connect once, stream bytes into the framer buffer, reconnect with exponential backoff + jitter on failure. Framed messages are decoded via an explicit command-byte registry into the in-memory snapshot. The connection is **never** torn down per frame (unlike PHP `PentairComFacade`).
 
 ## Recorded replay (automated soak)
 
@@ -68,7 +103,7 @@ Unit tests include an accelerated reconnect soak (local TCP flap + fixture repla
 docker compose run --rm pentairservice-dev cargo test short_automated_soak -- --nocapture
 ```
 
-One-shot replay while serving health:
+One-shot replay while serving the status API:
 
 ```bash
 docker compose run --rm --service-ports \
@@ -107,12 +142,16 @@ docker compose run --rm --network=host \
 | `src/main.rs` | Thin binary entry | Facade |
 | `src/config.rs` | Settings load (file + env) | Builder / Configuration Object |
 | `src/framer.rs` | Streaming A5 + IntelliChlor sync/seek | Parser / State Machine |
+| `src/messages.rs` | SystemStatus / TempStatus / Unknown DTOs | Command / Message |
+| `src/registry.rs` | cmd-byte → parser map | Factory |
+| `src/state.rs` | Latest snapshot + frames ring | Facade (shared state) |
 | `src/transport/` | TCP / serial / replay + reconnect Actor | Strategy + Actor |
 | `src/logging.rs` | Tracing subscriber init | Facade |
 | `src/api/` | Local HTTP surface | Facade |
 | `src/api/health.rs` | `GET /health` | Facade (API surface) |
+| `src/api/status.rs` | `GET /status`, `GET /frames` | Facade (API surface) |
 | `fixtures/` | Hex samples for framer + replay tests | — |
 
 ## Milestone
 
-Track B **B2** persistent transport + reconnect (on B1 framer). Status decode API is B3.
+Track B **B3** decode + status snapshot API (on B2 transport).
