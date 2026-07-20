@@ -1,0 +1,482 @@
+//! Library root for `pentairservice`.
+//!
+//! Pattern: **Facade** — this crate is the application façade over config, logging,
+//! framing, transport Actor, decode registry, in-memory state, optional frame journal,
+//! write gate, and the local HTTP API.
+
+#![deny(missing_docs)]
+
+pub mod api;
+pub mod commands;
+pub mod config;
+pub mod framer;
+pub mod journal;
+pub mod logging;
+pub mod messages;
+pub mod registry;
+pub mod state;
+pub mod transport;
+pub mod write;
+
+use std::net::SocketAddr;
+
+use axum::Router;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+use tracing::{info, warn};
+
+use crate::config::Config;
+use crate::journal::{
+    shared_file_journal, FileFrameJournal, RetentionPolicy, SharedIngest,
+};
+use crate::registry::MessageRegistry;
+use crate::state::{shared_bus_state, SharedBusState};
+use crate::transport::actor::{spawn_from_url, BusActorConfig};
+use crate::write::{BusWriteHandle, SharedWriteGate, WriteGate};
+
+/// Logs whether a transport URL is present (idle vs Actor will own the bus).
+///
+/// Pattern: **Facade** helper — keeps messaging out of the HTTP start path.
+pub fn log_transport_idle_state(config: &Config) {
+    match config
+        .transport_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        Some(url) => info!(
+            transport_url = %url,
+            "transport configured; bus Actor will own a persistent connection"
+        ),
+        None => info!("no transport_url configured; idling without bus connection"),
+    }
+}
+
+/// Opens the optional append-only frame journal from config.
+///
+/// Pattern: **Repository** factory — file log on the bind-mounted volume.
+fn open_journal_from_config(config: &Config) -> SharedIngest {
+    let Some(path) = config.journal_path.as_ref() else {
+        info!("frame journal disabled (no journal_path)");
+        return None;
+    };
+    let retention = RetentionPolicy {
+        max_bytes: config.journal_max_bytes,
+        max_age_secs: config.journal_max_age_secs,
+    };
+    match FileFrameJournal::open(path, retention) {
+        Ok(j) => {
+            info!(
+                path = %path.display(),
+                max_bytes = ?config.journal_max_bytes,
+                max_age_secs = ?config.journal_max_age_secs,
+                "frame journal open (Append-Only Log)"
+            );
+            shared_file_journal(j)
+        }
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to open frame journal; continuing without durable log"
+            );
+            None
+        }
+    }
+}
+
+/// Runs the service: optional bus Actor + local API until the listener fails.
+///
+/// When `transport_url` is set, a **single** tokio task owns the socket/port,
+/// feeds the streaming framer, and reconnects with backoff — never open/close
+/// per frame. Framed output is decoded into the shared status snapshot and
+/// optionally appended to the frame journal. Writes go through the Actor TX
+/// channel only when `writes_enabled=true` (default **false** = dry-run).
+///
+/// Pattern: **Facade** — single entry that composes config + transport Actor + API.
+pub async fn run(config: Config) -> Result<(), std::io::Error> {
+    let addr: SocketAddr = config
+        .bind_addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+    log_transport_idle_state(&config);
+    info!(
+        writes_enabled = config.writes_enabled,
+        listen_window_ms = config.listen_window_ms,
+        "write gate configured (default dry-run when writes_enabled=false)"
+    );
+
+    let state = shared_bus_state();
+    let journal = open_journal_from_config(&config);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let (write_handle, write_rx) = if config.writes_enabled {
+        let (h, rx) = BusWriteHandle::channel(8);
+        (Some(h), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let gate = WriteGate::new(
+        config.writes_enabled,
+        config.listen_window_ms,
+        write_handle.clone(),
+    )
+    .shared();
+
+    let bus = spawn_bus_if_configured(
+        &config,
+        shutdown_rx,
+        std::sync::Arc::clone(&state),
+        journal,
+        write_rx,
+    );
+
+    let app = build_router(std::sync::Arc::clone(&state), std::sync::Arc::clone(&gate));
+    let listener = TcpListener::bind(addr).await?;
+    let local = listener.local_addr()?;
+    info!(%local, "listening");
+
+    let serve_result = axum::serve(listener, app).await;
+
+    let _ = shutdown_tx.send(true);
+    if let Some(handle) = bus {
+        match handle.await {
+            Ok(stats) => info!(
+                connects = stats.connects,
+                reconnects = stats.reconnects,
+                frames = stats.frames,
+                bytes = stats.bytes_read,
+                "bus Actor finished"
+            ),
+            Err(e) => warn!(error = %e, "bus Actor join error"),
+        }
+    }
+
+    serve_result
+}
+
+/// Spawns the bus Actor when a non-empty transport URL is configured.
+fn spawn_bus_if_configured(
+    config: &Config,
+    shutdown: watch::Receiver<bool>,
+    state: SharedBusState,
+    journal: SharedIngest,
+    write_rx: Option<tokio::sync::mpsc::Receiver<crate::write::BusWriteRequest>>,
+) -> Option<tokio::task::JoinHandle<crate::transport::BusStats>> {
+    let url = config
+        .transport_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())?;
+
+    match spawn_from_url(
+        url,
+        BusActorConfig::default(),
+        shutdown,
+        state,
+        MessageRegistry::with_defaults(),
+        journal,
+        write_rx,
+    ) {
+        Ok((handle, _counters)) => {
+            info!(transport_url = %url, "bus Actor spawned");
+            Some(handle)
+        }
+        Err(e) => {
+            warn!(
+                transport_url = %url,
+                error = %e,
+                "failed to create transport; HTTP will still serve /health and /status"
+            );
+            None
+        }
+    }
+}
+
+/// Builds the Axum router for the local HTTP API.
+///
+/// Pattern: **Facade** — exposes `GET /health`, `/status`, `/frames`, `POST /command`.
+pub fn build_router(state: SharedBusState, gate: SharedWriteGate) -> Router {
+    api::router(state, gate)
+}
+
+/// Test helper: dry-run write gate (writes_enabled=false).
+#[cfg(test)]
+pub fn test_write_gate() -> SharedWriteGate {
+    WriteGate::new(false, 50, None).shared()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::state::shared_bus_state;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    #[test]
+    fn build_router_is_non_empty() {
+        let _router = build_router(shared_bus_state(), test_write_gate());
+    }
+
+    #[test]
+    fn log_transport_idle_with_and_without_url() {
+        let idle = Config::default();
+        log_transport_idle_state(&idle);
+
+        let with_url = Config {
+            bind_addr: "127.0.0.1:0".into(),
+            transport_url: Some("tcp://127.0.0.1:8899".into()),
+            log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
+            writes_enabled: false,
+            listen_window_ms: 500,
+        };
+        log_transport_idle_state(&with_url);
+
+        let blank = Config {
+            bind_addr: "127.0.0.1:0".into(),
+            transport_url: Some("  ".into()),
+            log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
+            writes_enabled: false,
+            listen_window_ms: 500,
+        };
+        log_transport_idle_state(&blank);
+    }
+
+    #[tokio::test]
+    async fn run_rejects_invalid_bind_addr() {
+        let cfg = Config {
+            bind_addr: "not-a-socket".into(),
+            transport_url: None,
+            log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
+            writes_enabled: false,
+            listen_window_ms: 500,
+        };
+        let err = run(cfg).await.expect_err("invalid bind must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn run_serves_health_then_abort() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cfg = Config {
+            bind_addr: addr.to_string(),
+            transport_url: None,
+            log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
+            writes_enabled: false,
+            listen_window_ms: 500,
+        };
+
+        let handle = tokio::spawn(async move { run(cfg).await });
+
+        let client = reqwest_get(&addr, "/health").await;
+        assert_eq!(client, r#"{"status":"ok"}"#);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn run_with_replay_updates_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cfg = Config {
+            bind_addr: addr.to_string(),
+            transport_url: Some("replay:fixtures/status_temps.hex".into()),
+            log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
+            writes_enabled: false,
+            listen_window_ms: 500,
+        };
+
+        let handle = tokio::spawn(async move { run(cfg).await });
+
+        let mut saw_temps = false;
+        for _ in 0..100 {
+            if let Ok(body) = tiny_http_get(&format!("http://{addr}/status")).await {
+                if body.contains("\"tempStatus\"") && !body.contains("\"tempStatus\":null") {
+                    saw_temps = true;
+                    // PHP field names present.
+                    assert!(body.contains("waterSet") || body.contains("water"));
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw_temps, "expected /status to populate from replay");
+
+        let health = reqwest_get(&addr, "/health").await;
+        assert_eq!(health, r#"{"status":"ok"}"#);
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn run_with_replay_writes_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("watch.journal");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cfg = Config {
+            bind_addr: addr.to_string(),
+            transport_url: Some("replay:fixtures/status_temps.hex".into()),
+            log_level: "info".into(),
+            journal_path: Some(journal_path.clone()),
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
+            writes_enabled: false,
+            listen_window_ms: 500,
+        };
+
+        let handle = tokio::spawn(async move { run(cfg).await });
+
+        let mut saw_temps = false;
+        for _ in 0..100 {
+            if let Ok(body) = tiny_http_get(&format!("http://{addr}/status")).await {
+                if body.contains("\"tempStatus\"") && !body.contains("\"tempStatus\":null") {
+                    saw_temps = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw_temps);
+
+        // Allow journal flush from decode drain.
+        for _ in 0..50 {
+            if journal_path.is_file() {
+                if let Ok(recs) = crate::journal::FileFrameJournal::read_all(&journal_path) {
+                    if !recs.is_empty() {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        handle.abort();
+        let _ = handle.await;
+
+        let records = crate::journal::FileFrameJournal::read_all(&journal_path).unwrap();
+        assert!(
+            !records.is_empty(),
+            "expected journal entries from replay watch session"
+        );
+        let raws = crate::journal::FileFrameJournal::replay_raw(&journal_path).unwrap();
+        assert_eq!(raws.len(), records.len());
+        assert!(!raws[0].is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_bus_invalid_url_still_ok() {
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".into(),
+            transport_url: Some("http://not-supported".into()),
+            log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
+            writes_enabled: false,
+            listen_window_ms: 500,
+        };
+        let (_tx, rx) = watch::channel(false);
+        let state = shared_bus_state();
+        assert!(spawn_bus_if_configured(&cfg, rx, state, None, None).is_none());
+    }
+
+    #[test]
+    fn spawn_bus_none_without_url() {
+        let cfg = Config::default();
+        let (_tx, rx) = watch::channel(false);
+        let state = shared_bus_state();
+        assert!(spawn_bus_if_configured(&cfg, rx, state, None, None).is_none());
+    }
+
+    #[test]
+    fn open_journal_none_without_path() {
+        let cfg = Config::default();
+        assert!(open_journal_from_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn open_journal_from_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.journal");
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".into(),
+            transport_url: None,
+            log_level: "info".into(),
+            journal_path: Some(path.clone()),
+            journal_max_bytes: Some(1024),
+            journal_max_age_secs: Some(60),
+            writes_enabled: false,
+            listen_window_ms: 500,
+        };
+        let ingest = open_journal_from_config(&cfg);
+        assert!(ingest.is_some());
+        assert!(path.is_file());
+    }
+
+    async fn reqwest_get(addr: &SocketAddr, path: &str) -> String {
+        let url = format!("http://{addr}{path}");
+        for _ in 0..50 {
+            if let Ok(resp) = tiny_http_get(&url).await {
+                return resp;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let app = build_router(shared_bus_state(), test_write_gate());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    async fn tiny_http_get(url: &str) -> Result<String, std::io::Error> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let url = url.strip_prefix("http://").unwrap_or(url);
+        let (host_port, path) = url.split_once('/').unwrap_or((url, ""));
+        let path = format!("/{path}");
+        let mut stream = tokio::net::TcpStream::connect(host_port).await?;
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {host_port}\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        let text = String::from_utf8_lossy(&buf);
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim().to_string();
+        Ok(body)
+    }
+}

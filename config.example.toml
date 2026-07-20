@@ -1,0 +1,46 @@
+# Example config for pentairservice.
+# Copy to config.toml or point PENTAIR_CONFIG at a path.
+# Leave transport_url empty/unset to idle without opening a transport.
+# RPi / ops runbook: docs/rpi-ops.md (udev, dialout, systemd vs Docker).
+
+# Bind address for the local HTTP API (host:port).
+# Example: listen on all interfaces at the default operator port.
+bind_addr = "0.0.0.0:28471"
+
+# How the service reaches the pool bus. Owned by one connection task; leave empty to idle.
+# Pick ONE live mode — do not open EW11 and RS-485 as two active masters.
+#
+# --- EW11 / TCP bridge ---
+# transport_url = "tcp://10.0.0.11:8899"
+# Env: PENTAIR_TRANSPORT_URL=tcp://10.0.0.11:8899
+#
+# --- Direct RS-485 on Pi (prefer stable udev symlink; see docs/rpi-ops.md) ---
+# transport_url = "/dev/ttyPentair"
+# transport_url = "serial:/dev/ttyPentair?baud=9600"
+# Env: PENTAIR_TRANSPORT_URL=/dev/ttyPentair
+#
+# --- Other / lab ---
+#   /dev/ttyUSB0                     — serial (default baud 9600 8N1)
+#   serial:/dev/ttyUSB0?baud=9600    — serial with explicit baud
+#   replay:fixtures/status_temps.hex — recorded fixture (CI / no live bus)
+# Empty / omitted → service starts and serves /health without connecting.
+# transport_url = "tcp://10.0.0.11:8899"
+
+# Log level filter (also overridable via RUST_LOG).
+# Example: "info" for normal ops; "debug" when diagnosing reconnects.
+# log_level = "info"
+
+# Append-only frame journal on the bind-mounted volume.
+# Path is relative to the container WORKDIR (/workspace) unless absolute.
+# Each data line ends with lowercase hex of the framed bytes.
+# journal_path = "data/frames.journal"
+# Soft size cap (bytes); vacuum keeps trailing complete lines when exceeded.
+# journal_max_bytes = 10485760
+# Soft age cap (seconds); age trim is a stub (config accepted, no-op vacuum).
+# journal_max_age_secs = 604800
+
+# Write gate. Default OFF — POST /command dry-runs with fixture ACK verdicts
+# so CI never needs a live controller. Set true only for lab / production TX.
+# writes_enabled = false
+# Post-TX listen window (ms) for ACK / status classification.
+# listen_window_ms = 500
