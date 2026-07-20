@@ -1,8 +1,8 @@
-# Lab dual-mode proof notes (Track E5 template)
+# Lab dual-mode proof notes
 
-**Status:** Optional template only. Leave E5 unchecked until real hardware trials are recorded here (or linked). Do **not** invent results.
+**Status:** Optional template only. Fill after real hardware trials. Do **not** invent results.
 
-Fill after running `pentairservice` (and/or snoop) against the **same** panel via EW11 TCP **and** via serial, one owner at a time.
+Use this worksheet after running `pentairservice` against the **same** panel via EW11 TCP **and** via serial, one owner at a time.
 
 ---
 
@@ -24,7 +24,7 @@ Fill after running `pentairservice` (and/or snoop) against the **same** panel vi
 | `transport_url` / env | e.g. `tcp://10.0.0.11:8899` |
 | EW11 host:port | |
 | Other processes holding this endpoint? | none / list |
-| `GET /health` | |
+| `GET /health` | e.g. `http://127.0.0.1:28471/health` |
 | `GET /status` summary (temps / circuits of interest) | |
 | Notes | |
 

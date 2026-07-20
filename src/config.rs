@@ -12,7 +12,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// Default bind address for the local HTTP API.
-pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
+pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:28471";
 
 /// Default tracing filter when neither file nor env sets a level.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
@@ -539,12 +539,12 @@ log_level = "error"
         .unwrap();
 
         let _g1 = EnvGuard::set(ENV_CONFIG_PATH, path.to_str().unwrap());
-        let _g2 = EnvGuard::set(ENV_BIND_ADDR, "127.0.0.1:8080");
+        let _g2 = EnvGuard::set(ENV_BIND_ADDR, "127.0.0.1:28471");
         let _g3 = EnvGuard::set(ENV_TRANSPORT_URL, "");
         let _g4 = EnvGuard::set(ENV_LOG_LEVEL, "debug");
 
         let cfg = Config::load().unwrap();
-        assert_eq!(cfg.bind_addr, "127.0.0.1:8080");
+        assert_eq!(cfg.bind_addr, "127.0.0.1:28471");
         assert!(!cfg.has_transport());
         assert_eq!(cfg.log_level, "debug");
     }

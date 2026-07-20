@@ -8,7 +8,7 @@ services:
       # Host source → container workspace (edit on host; build/run in container)
       - ./:/workspace
     ports:
-      - "8080:8080"
+      - "28471:28471"
     stdin_open: true
     tty: true
     command: ["bash"]

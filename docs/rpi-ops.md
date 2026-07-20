@@ -1,23 +1,23 @@
 # Raspberry Pi / ops runbook (EW11 TCP vs RS-485)
 
-Operator guide for deploying **`pentairservice`** as the production bus owner on a Raspberry Pi (or similar Debian host). Switch between **Elfin EW11 (TCP)** and **direct USB-RS485 / HAT (serial)** with config alone — no code change.
+Operator guide for deploying **`pentairservice`** as the bus owner on a Raspberry Pi (or similar Debian host). Switch between **Elfin EW11 (TCP)** and **direct USB-RS485 / HAT (serial)** with config alone — no code change.
 
-**Related:** Track E design [`07-transport-di-ew11-rs485.md`](../../agents/plans/07-transport-di-ew11-rs485.md) (parent repo), Debian Docker validation [`06-pentairservice-docker-dev.md`](../../agents/plans/06-pentairservice-docker-dev.md), service [`README.md`](../README.md).
+See also the service [`README.md`](../README.md).
 
 ---
 
-## Canonical vs live hardware
+## Build vs live hardware
 
 | Role | Environment | Notes |
 |------|-------------|--------|
-| **Build / test / coverage** | **Debian Docker** (`docker compose` in this tree) | Authoritative DoD. No real tty required. |
+| **Build / test / coverage** | Docker (`docker compose` in this tree) | No real tty required. |
 | **Production / lab I/O** | Host on the Pi (or Docker with device pass-through) | Live `tcp://` or `/dev/tty*` only here. |
 
-Host `cargo` on macOS is non-authoritative. Live serial is **lab/Pi only**; do not treat “passes on Darwin” as deploy proof.
+Develop and run in Docker for the usual toolchain; use live serial on the Pi (or device pass-through) when exercising hardware.
 
 ---
 
-## Transport URL forms (canonical)
+## Transport URL forms
 
 Same vocabulary as the service `transport_url` / `PENTAIR_TRANSPORT_URL`:
 
@@ -30,7 +30,7 @@ Same vocabulary as the service `transport_url` / `PENTAIR_TRANSPORT_URL`:
 
 **Defaults:** baud **9600**, data **8**, parity **none**, stop **1**, no hardware flow control. Confirm per adapter if TX fails.
 
-**Ownership:** at most **one** process opens a given EW11 endpoint or serial device. Stop snoop / PHP-native before starting the service on the same URL.
+**Ownership:** at most **one** process opens a given EW11 endpoint or serial device. Stop any other bus owner before starting the service on the same URL.
 
 ---
 
@@ -41,30 +41,36 @@ Same vocabulary as the service `transport_url` / `PENTAIR_TRANSPORT_URL`:
 `config.toml`:
 
 ```toml
-bind_addr = "0.0.0.0:8080"
+bind_addr = "0.0.0.0:28471"
 transport_url = "tcp://10.0.0.11:8899"
 log_level = "info"
 # writes_enabled = false   # keep false until lab TX is intentional
 ```
 
+Listens on the default HTTP port and opens a persistent TCP session to the EW11.
+
 Env equivalent:
 
 ```bash
 export PENTAIR_TRANSPORT_URL=tcp://10.0.0.11:8899
-export PENTAIR_BIND_ADDR=0.0.0.0:8080
+export PENTAIR_BIND_ADDR=0.0.0.0:28471
 # optional: PENTAIR_CONFIG=/etc/pentairservice/config.toml
 ```
+
+Same settings via environment variables for containers or systemd `Environment=` lines.
 
 ### Direct RS-485 (`/dev/ttyPentair`)
 
 `config.toml`:
 
 ```toml
-bind_addr = "0.0.0.0:8080"
+bind_addr = "0.0.0.0:28471"
 transport_url = "/dev/ttyPentair"
 # or: transport_url = "serial:/dev/ttyPentair?baud=9600"
 log_level = "info"
 ```
+
+Uses the stable udev symlink and default serial framing.
 
 Env equivalent:
 
@@ -89,6 +95,8 @@ ls -l /dev/ttyUSB* /dev/ttyACM* 2>/dev/null
 udevadm info -a -n /dev/ttyUSB0 | head -80
 ```
 
+Lists USB IDs and udev attributes so you can write a stable rule.
+
 2. Install a rule (replace `idVendor` / `idProduct` from your adapter):
 
 ```text
@@ -97,6 +105,8 @@ udevadm info -a -n /dev/ttyUSB0 | head -80
 SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", SYMLINK+="ttyPentair", GROUP="dialout", MODE="0660"
 ```
 
+Creates `/dev/ttyPentair` whenever that adapter is present.
+
 3. Reload and verify:
 
 ```bash
@@ -104,6 +114,8 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ls -l /dev/ttyPentair
 ```
+
+Applies the rule and confirms the symlink exists.
 
 Config then uses `transport_url = "/dev/ttyPentair"` (or `serial:/dev/ttyPentair?baud=9600`).
 
@@ -119,6 +131,8 @@ On Debian / Raspberry Pi OS, serial devices are typically group **`dialout`**:
 sudo usermod -aG dialout pentair   # or the service user
 # log out/in (or reboot) so the new group applies for interactive shells
 ```
+
+Adds the service user to `dialout` so it can open `/dev/ttyPentair`.
 
 udev `GROUP="dialout"` + `MODE="0660"` (as above) matches this model.
 
@@ -156,19 +170,23 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
+Runs the binary as user `pentair` with `dialout` and a fixed config path.
+
 EW11 TCP mode can use the same unit with `transport_url = "tcp://…"`.
 
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now pentairservice
-curl -s http://127.0.0.1:8080/health
+curl -s http://127.0.0.1:28471/health
 ```
+
+Reloads units, starts the service, and checks the default HTTP port.
 
 ---
 
 ## Docker `--device=` (lab / optional)
 
-Debian Docker remains the **build/test** canonical environment. For a **live serial soak inside a container** on the Pi:
+Docker remains the usual **build/test** environment. For a **live serial soak inside a container** on the Pi:
 
 ```bash
 docker compose run --rm --service-ports \
@@ -177,16 +195,18 @@ docker compose run --rm --service-ports \
   pentairservice-dev cargo run
 ```
 
+Passes the host tty into the container and opens it as the transport.
+
 ### Tradeoffs: systemd host vs Docker device
 
 | | Host systemd | Docker `--device=` |
 |--|--------------|-------------------|
 | Serial production | **Preferred** — direct `/dev` access, `SupplementaryGroups=dialout` | Works but needs device + group/cgroup mapping; path must exist at start |
-| EW11 TCP | Fine either way | Often easier (no tty; publish `8080`, reach LAN IP) |
-| Rebuild / CI | N/A | **Canonical** for `cargo test` / `llvm-cov` |
+| EW11 TCP | Fine either way | Often easier (no tty; publish `28471`, reach LAN IP) |
+| Rebuild / CI | N/A | Convenient for `cargo test` / `llvm-cov` |
 | Symlink renames | udev updates host path immediately | May need container restart if the node appears after start |
 
-**Recommendation:** develop and gate coverage in Debian Docker; deploy serial production under **host systemd**; use Docker `--device=` for short lab soaks if convenient.
+**Recommendation:** develop and gate coverage in Docker; deploy serial production under **host systemd**; use Docker `--device=` for short lab soaks if convenient.
 
 ---
 
@@ -203,9 +223,7 @@ Do not run both as active masters on the same A5 conversation. Two USB adapters 
 
 ## Quick validation checklist
 
-1. `curl -s http://127.0.0.1:8080/health` → `{"status":"ok"}`
+1. `curl -s http://127.0.0.1:28471/health` → `{"status":"ok"}`
 2. With transport configured: logs show bus connect; `GET /status` eventually shows non-null temps/status when the panel is talking.
 3. Serial: `ls -l /dev/ttyPentair` and confirm the service user can open it (`groups` includes `dialout`).
-4. Dual-mode lab proof (same status via tcp **and** serial) is Track **E5** — record notes separately; do not claim RS-485 first-class until E5 is done.
-
-Optional lab template: [`lab-e5-NOTES.md`](lab-e5-NOTES.md).
+4. Optional dual-path lab (same status via tcp **and** serial, one owner at a time): record notes in [`lab-NOTES.md`](lab-NOTES.md).
