@@ -25,3 +25,9 @@ bind_addr = "0.0.0.0:8080"
 # journal_max_bytes = 10485760
 # Soft age cap (seconds); age trim is a stub (config accepted, no-op vacuum).
 # journal_max_age_secs = 604800
+
+# Write gate (B5). Default OFF — POST /command dry-runs with fixture ACK verdicts
+# so CI never needs a live controller. Set true only for lab / production TX.
+# writes_enabled = false
+# Post-TX listen window (ms) for ACK / status classification.
+# listen_window_ms = 500

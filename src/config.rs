@@ -38,6 +38,15 @@ pub const ENV_JOURNAL_MAX_BYTES: &str = "PENTAIR_JOURNAL_MAX_BYTES";
 /// Environment variable for journal max age in seconds (retention stub).
 pub const ENV_JOURNAL_MAX_AGE_SECS: &str = "PENTAIR_JOURNAL_MAX_AGE_SECS";
 
+/// Environment variable: allow live bus TX (`true`/`1`/`yes`). Default off.
+pub const ENV_WRITES_ENABLED: &str = "PENTAIR_WRITES_ENABLED";
+
+/// Environment variable: post-TX listen window in milliseconds.
+pub const ENV_LISTEN_WINDOW_MS: &str = "PENTAIR_LISTEN_WINDOW_MS";
+
+/// Default post-TX listen window (ms).
+pub const DEFAULT_LISTEN_WINDOW_MS: u64 = 500;
+
 /// Errors while loading or validating configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -59,6 +68,9 @@ pub enum ConfigError {
     /// Journal retention numeric env/file value is not a valid integer.
     #[error("invalid journal retention number: {0}")]
     BadJournalNumber(String),
+    /// Boolean / numeric write-gate env/file value is invalid.
+    #[error("invalid write-gate setting: {0}")]
+    BadWriteSetting(String),
 }
 
 /// Immutable runtime settings for the service.
@@ -78,6 +90,10 @@ pub struct Config {
     pub journal_max_bytes: Option<u64>,
     /// Soft max journal age in seconds (retention stub / no-op age trim); `None` = unbounded.
     pub journal_max_age_secs: Option<u64>,
+    /// When false (default), `POST /command` dry-runs and never TX on the live bus.
+    pub writes_enabled: bool,
+    /// Milliseconds to capture RX after a write (listen window).
+    pub listen_window_ms: u64,
 }
 
 impl Default for Config {
@@ -89,6 +105,8 @@ impl Default for Config {
             journal_path: None,
             journal_max_bytes: None,
             journal_max_age_secs: None,
+            writes_enabled: false,
+            listen_window_ms: DEFAULT_LISTEN_WINDOW_MS,
         }
     }
 }
@@ -130,6 +148,8 @@ pub struct ConfigBuilder {
     journal_path: Option<Option<PathBuf>>,
     journal_max_bytes: Option<Option<u64>>,
     journal_max_age_secs: Option<Option<u64>>,
+    writes_enabled: Option<bool>,
+    listen_window_ms: Option<u64>,
 }
 
 impl ConfigBuilder {
@@ -196,6 +216,18 @@ impl ConfigBuilder {
         self
     }
 
+    /// Enables or disables live bus TX (`false` = dry-run only).
+    pub fn writes_enabled(mut self, enabled: bool) -> Self {
+        self.writes_enabled = Some(enabled);
+        self
+    }
+
+    /// Sets the post-TX listen window in milliseconds.
+    pub fn listen_window_ms(mut self, ms: u64) -> Self {
+        self.listen_window_ms = Some(ms.max(1));
+        self
+    }
+
     /// Merges values from a TOML file (missing keys leave prior builder state).
     pub fn merge_file(mut self, path: &Path) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -220,6 +252,12 @@ impl ConfigBuilder {
         }
         if let Some(n) = file.journal_max_age_secs {
             self.journal_max_age_secs = Some(Some(n));
+        }
+        if let Some(w) = file.writes_enabled {
+            self.writes_enabled = Some(w);
+        }
+        if let Some(ms) = file.listen_window_ms {
+            self.listen_window_ms = Some(ms.max(1));
         }
         Ok(self)
     }
@@ -268,6 +306,21 @@ impl ConfigBuilder {
                 builder = builder.journal_max_age_secs(Some(n));
             }
         }
+        if let Ok(raw) = env::var(ENV_WRITES_ENABLED) {
+            if !raw.trim().is_empty() {
+                builder = builder.writes_enabled(parse_bool_env(&raw).map_err(|_| {
+                    ConfigError::BadWriteSetting(format!("{ENV_WRITES_ENABLED}={raw}"))
+                })?);
+            }
+        }
+        if let Ok(raw) = env::var(ENV_LISTEN_WINDOW_MS) {
+            if !raw.trim().is_empty() {
+                let n: u64 = raw.trim().parse().map_err(|_| {
+                    ConfigError::BadWriteSetting(format!("{ENV_LISTEN_WINDOW_MS}={raw}"))
+                })?;
+                builder = builder.listen_window_ms(n);
+            }
+        }
 
         Ok(builder)
     }
@@ -287,6 +340,11 @@ impl ConfigBuilder {
         let journal_path = self.journal_path.unwrap_or(None);
         let journal_max_bytes = self.journal_max_bytes.unwrap_or(None);
         let journal_max_age_secs = self.journal_max_age_secs.unwrap_or(None);
+        let writes_enabled = self.writes_enabled.unwrap_or(false);
+        let listen_window_ms = self
+            .listen_window_ms
+            .unwrap_or(DEFAULT_LISTEN_WINDOW_MS)
+            .max(1);
 
         Ok(Config {
             bind_addr,
@@ -295,6 +353,8 @@ impl ConfigBuilder {
             journal_path,
             journal_max_bytes,
             journal_max_age_secs,
+            writes_enabled,
+            listen_window_ms,
         })
     }
 }
@@ -308,6 +368,16 @@ struct FileConfig {
     journal_path: Option<String>,
     journal_max_bytes: Option<u64>,
     journal_max_age_secs: Option<u64>,
+    writes_enabled: Option<bool>,
+    listen_window_ms: Option<u64>,
+}
+
+fn parse_bool_env(raw: &str) -> Result<bool, ()> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(()),
+    }
 }
 
 /// Resolves config file path: `PENTAIR_CONFIG` if set, else `./config.toml` when it exists.
@@ -503,6 +573,8 @@ log_level = "error"
             journal_path: None,
             journal_max_bytes: None,
             journal_max_age_secs: None,
+            writes_enabled: false,
+            listen_window_ms: 500,
         };
         assert!(!cfg.has_transport());
         assert!(!cfg.has_journal());
@@ -634,6 +706,8 @@ journal_max_age_secs = 86400
         let _g5 = EnvGuard::unset(ENV_JOURNAL_PATH);
         let _g6 = EnvGuard::unset(ENV_JOURNAL_MAX_BYTES);
         let _g7 = EnvGuard::unset(ENV_JOURNAL_MAX_AGE_SECS);
+        let _g8 = EnvGuard::unset(ENV_WRITES_ENABLED);
+        let _g9 = EnvGuard::unset(ENV_LISTEN_WINDOW_MS);
 
         let cfg = ConfigBuilder::new().from_env_and_disk().unwrap().build().unwrap();
         // If a local config.toml exists it may override; bind from empty env must not.
@@ -651,5 +725,55 @@ journal_max_age_secs = 86400
         assert!(io.to_string().contains("/x"));
         let bad = ConfigError::BadJournalNumber("x".into());
         assert!(bad.to_string().contains("journal"));
+        let badw = ConfigError::BadWriteSetting("x".into());
+        assert!(badw.to_string().contains("write-gate"));
+    }
+
+    #[test]
+    fn writes_enabled_builder_and_file() {
+        let cfg = ConfigBuilder::new()
+            .writes_enabled(true)
+            .listen_window_ms(250)
+            .build()
+            .unwrap();
+        assert!(cfg.writes_enabled);
+        assert_eq!(cfg.listen_window_ms, 250);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.toml");
+        fs::write(
+            &path,
+            "writes_enabled = true\nlisten_window_ms = 100\n",
+        )
+        .unwrap();
+        let cfg = ConfigBuilder::new().merge_file(&path).unwrap().build().unwrap();
+        assert!(cfg.writes_enabled);
+        assert_eq!(cfg.listen_window_ms, 100);
+    }
+
+    #[test]
+    fn writes_env_and_parse_bool() {
+        let _lock = env_lock().lock().unwrap();
+        let _g1 = EnvGuard::unset(ENV_CONFIG_PATH);
+        let _g2 = EnvGuard::set(ENV_WRITES_ENABLED, "yes");
+        let _g3 = EnvGuard::set(ENV_LISTEN_WINDOW_MS, "750");
+        let _g4 = EnvGuard::unset(ENV_BIND_ADDR);
+        let _g5 = EnvGuard::unset(ENV_TRANSPORT_URL);
+        let _g6 = EnvGuard::unset(ENV_LOG_LEVEL);
+        let _g7 = EnvGuard::unset(ENV_JOURNAL_PATH);
+        let _g8 = EnvGuard::unset(ENV_JOURNAL_MAX_BYTES);
+        let _g9 = EnvGuard::unset(ENV_JOURNAL_MAX_AGE_SECS);
+
+        let cfg = ConfigBuilder::new().from_env_and_disk().unwrap().build().unwrap();
+        assert!(cfg.writes_enabled);
+        assert_eq!(cfg.listen_window_ms, 750);
+
+        assert_eq!(parse_bool_env("true").unwrap(), true);
+        assert_eq!(parse_bool_env("0").unwrap(), false);
+        assert!(parse_bool_env("maybe").is_err());
+
+        let _g2b = EnvGuard::set(ENV_WRITES_ENABLED, "maybe");
+        let err = ConfigBuilder::new().from_env_and_disk().unwrap_err();
+        assert!(matches!(err, ConfigError::BadWriteSetting(_)));
     }
 }

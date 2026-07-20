@@ -64,8 +64,8 @@ docker run --rm -it -v "$PWD":/workspace -w /workspace -p 8080:8080 pentairservi
 
 | Source | Keys |
 |--------|------|
-| Env | `PENTAIR_BIND_ADDR`, `PENTAIR_TRANSPORT_URL`, `PENTAIR_LOG_LEVEL`, `PENTAIR_CONFIG`, `PENTAIR_JOURNAL_PATH`, `PENTAIR_JOURNAL_MAX_BYTES`, `PENTAIR_JOURNAL_MAX_AGE_SECS` |
-| TOML | `bind_addr`, `transport_url`, `log_level`, `journal_path`, `journal_max_bytes`, `journal_max_age_secs` (see `config.example.toml`) |
+| Env | `PENTAIR_BIND_ADDR`, `PENTAIR_TRANSPORT_URL`, `PENTAIR_LOG_LEVEL`, `PENTAIR_CONFIG`, `PENTAIR_JOURNAL_PATH`, `PENTAIR_JOURNAL_MAX_BYTES`, `PENTAIR_JOURNAL_MAX_AGE_SECS`, `PENTAIR_WRITES_ENABLED`, `PENTAIR_LISTEN_WINDOW_MS` |
+| TOML | `bind_addr`, `transport_url`, `log_level`, `journal_path`, `journal_max_bytes`, `journal_max_age_secs`, `writes_enabled`, `listen_window_ms` (see `config.example.toml`) |
 
 Defaults: bind `0.0.0.0:8080`, no transport, no journal. With an empty/unset `transport_url`, the service **idles** and serves `GET /health` / `/status` / `/frames` without opening TCP/serial.
 
@@ -92,6 +92,34 @@ docker compose run --rm --service-ports \
 | `GET` | `/health` | `{"status":"ok"}` |
 | `GET` | `/status` | Latest `systemStatus` + `tempStatus` (PHP Command JSON field names) or null |
 | `GET` | `/frames?limit=` | Newest-first ring (default `limit=32`, max 128) |
+| `POST` | `/command` | Typed CircuitChange / HeatChange or raw hex — write gate (B5) |
+
+### Write gate (B5)
+
+`POST /command` accepts typed JSON or raw framed hex for confirmed write commands:
+
+- **CircuitChange** (`0x86`): `{"type":"CircuitChange","circuit":6,"on":true}` or `"circuit":"pool_light"`
+- **HeatChange** (`0x88`): `{"type":"HeatChange","poolSet":43,"spaSet":96,"mode":5}`
+- **Raw hex**: `{"hex":"ff00ffa507102088042b60050001f8"}`
+
+**Mutex policy:** only one in-flight write; concurrent requests are **rejected** with HTTP 409 (`busy`), not queued.
+
+**Safety:** `writes_enabled` defaults to **false**. When disabled, the service **dry-runs**: builds TX hex (CS verified), simulates the listen-window verdict from fixture ACK frames (`$set_temp_ack` / crafted circuit ACK), and never touches the live bus — CI passes without a controller.
+
+```bash
+# Dry-run (default)
+curl -s -X POST http://127.0.0.1:8080/command \
+  -H 'content-type: application/json' \
+  -d '{"type":"HeatChange","poolSet":43,"spaSet":96,"mode":5}'
+# {"dry_run":true,"tx_hex":"ff00ffa507102088042b60050001f8","command":136,"verdict":"ack",...}
+
+# Live TX (lab only)
+# -e PENTAIR_WRITES_ENABLED=true -e PENTAIR_TRANSPORT_URL=tcp://ew11:8899
+```
+
+Config / env: `writes_enabled` / `PENTAIR_WRITES_ENABLED`, `listen_window_ms` / `PENTAIR_LISTEN_WINDOW_MS` (default 500).
+
+Patterns: **Command** (craft), **Mutex/Gate**, **Actor** owns TX when enabled.
 
 **JSON field names** (compatible with future PHP `Command::fromJson`):
 
@@ -162,13 +190,16 @@ docker compose run --rm --network=host \
 | `src/registry.rs` | cmd-byte → parser map | Factory |
 | `src/state.rs` | Latest snapshot + frames ring | Facade (shared state) |
 | `src/journal.rs` | Append-only frame log + `FrameIngest` hook | Repository / Append-Only Log |
+| `src/commands.rs` | CircuitChange / HeatChange craft (`0x86`/`0x88`) | Command |
+| `src/write.rs` | Write gate Mutex + listen-window verdict | Mutex / Gate |
 | `src/transport/` | TCP / serial / replay + reconnect Actor | Strategy + Actor |
 | `src/logging.rs` | Tracing subscriber init | Facade |
 | `src/api/` | Local HTTP surface | Facade |
 | `src/api/health.rs` | `GET /health` | Facade (API surface) |
 | `src/api/status.rs` | `GET /status`, `GET /frames` | Facade (API surface) |
-| `fixtures/` | Hex samples for framer + replay tests | — |
+| `src/api/command.rs` | `POST /command` write gate | Facade (API surface) |
+| `fixtures/` | Hex samples for framer + replay + ACK tests | — |
 
 ## Milestone
 
-Track B **B4** append-only frame journal (on B3 status API).
+Track B **B5** write gate (final Track B milestone; stacked on B4 journal).

@@ -16,6 +16,7 @@ use crate::framer::{Frame, Framer};
 use crate::journal::SharedIngest;
 use crate::registry::MessageRegistry;
 use crate::state::{spawn_decode_drain, SharedBusState};
+use crate::write::BusWriteRequest;
 
 use super::backoff::{Backoff, BackoffConfig};
 use super::{ByteTransport, TransportError};
@@ -112,6 +113,8 @@ pub struct BusActor {
     transport: Box<dyn ByteTransport>,
     config: BusActorConfig,
     counters: Arc<BusCounters>,
+    /// Optional TX request channel (write gate → Actor).
+    write_rx: Option<mpsc::Receiver<BusWriteRequest>>,
 }
 
 impl BusActor {
@@ -121,7 +124,14 @@ impl BusActor {
             transport,
             config,
             counters: Arc::new(BusCounters::default()),
+            write_rx: None,
         }
+    }
+
+    /// Attaches the write-gate TX channel (Actor still owns the socket).
+    pub fn with_write_rx(mut self, rx: mpsc::Receiver<BusWriteRequest>) -> Self {
+        self.write_rx = Some(rx);
+        self
     }
 
     /// Shared counters for external observation during soak.
@@ -269,11 +279,26 @@ impl BusActor {
                 return SessionEnd::Shutdown;
             }
 
+            // Drain any pending write-gate TX without blocking the read path.
+            if let Some(rx) = self.write_rx.as_mut() {
+                while let Ok(req) = rx.try_recv() {
+                    let result = self.transport.write(&req.data).await;
+                    let _ = req.reply.send(result);
+                }
+            }
+
             let read_result = tokio::select! {
                 biased;
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         return SessionEnd::Shutdown;
+                    }
+                    continue;
+                }
+                req = recv_write_opt(self.write_rx.as_mut()) => {
+                    if let Some(req) = req {
+                        let result = self.transport.write(&req.data).await;
+                        let _ = req.reply.send(result);
                     }
                     continue;
                 }
@@ -298,7 +323,6 @@ impl BusActor {
                             "framed bus message"
                         );
                         if frame_tx.send(frame).await.is_err() {
-                            // Receiver dropped — treat as shutdown.
                             return SessionEnd::Shutdown;
                         }
                     }
@@ -308,6 +332,16 @@ impl BusActor {
         }
     }
 
+}
+
+/// Awaits a write request when a channel is present; otherwise pending forever.
+async fn recv_write_opt(
+    rx: Option<&mut mpsc::Receiver<BusWriteRequest>>,
+) -> Option<BusWriteRequest> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending::<Option<BusWriteRequest>>().await,
+    }
 }
 
 /// Sleeps backoff delay unless shutdown is signaled. Returns `false` if shutting down.
@@ -356,6 +390,8 @@ pub fn spawn_frame_drain(mut rx: mpsc::Receiver<Frame>) -> tokio::task::JoinHand
 ///
 /// Optional `journal` receives every framed message (Append-Only Log / future
 /// `signal/` ingest hook) before decode updates the snapshot.
+///
+/// Optional `write_rx` lets the write gate TX through the Actor (Actor owns the bus).
 pub fn spawn_from_url(
     url: &str,
     config: BusActorConfig,
@@ -363,9 +399,13 @@ pub fn spawn_from_url(
     state: SharedBusState,
     registry: MessageRegistry,
     journal: SharedIngest,
+    write_rx: Option<mpsc::Receiver<BusWriteRequest>>,
 ) -> Result<(tokio::task::JoinHandle<BusStats>, Arc<BusCounters>), TransportError> {
     let transport = super::from_url(url)?;
-    let actor = BusActor::new(transport, config);
+    let mut actor = BusActor::new(transport, config);
+    if let Some(rx) = write_rx {
+        actor = actor.with_write_rx(rx);
+    }
     let counters = actor.counters();
     let (tx, rx) = mpsc::channel(256);
     let _drain = spawn_decode_drain(rx, state, registry, journal);
@@ -682,6 +722,7 @@ mod tests {
             Arc::clone(&state),
             MessageRegistry::with_defaults(),
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -748,5 +789,48 @@ mod tests {
         .unwrap();
         drop(tx);
         assert_eq!(h.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn actor_handles_write_requests() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 16];
+            let n = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf))
+                .await
+                .expect("read timeout")
+                .unwrap();
+            assert!(n >= 2);
+            assert_eq!(&buf[..2], &[0xAA, 0xBB]);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        });
+
+        let transport = Box::new(TcpTransport::new("127.0.0.1", addr.port()));
+        let mut cfg = BusActorConfig::accelerated_for_tests();
+        cfg.reconnect_on_eof = false;
+
+        let (wtx, wrx) = crate::write::BusWriteHandle::channel(4);
+        let (tx, _rx) = mpsc::channel(8);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let actor = BusActor::new(transport, cfg).with_write_rx(wrx);
+        let counters = actor.counters();
+        let handle = actor.spawn(tx, shutdown_rx);
+
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                counters.connected.load(Ordering::Relaxed)
+            })
+            .await,
+            "actor should connect"
+        );
+        wtx.write(vec![0xAA, 0xBB]).await.unwrap();
+        server.await.unwrap();
+        let _ = shutdown_tx.send(true);
+        let stats = handle.await.unwrap();
+        assert!(stats.connects >= 1);
     }
 }
