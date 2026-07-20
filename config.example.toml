@@ -1,4 +1,4 @@
-# Example config for pentairservice (B2).
+# Example config for pentairservice (B4).
 # Copy to config.toml or point PENTAIR_CONFIG at a path.
 # Leave transport_url empty/unset to idle without opening a transport.
 
@@ -15,3 +15,13 @@ bind_addr = "0.0.0.0:8080"
 
 # Log level filter (also overridable via RUST_LOG)
 # log_level = "info"
+
+# Append-only frame journal on the bind-mounted volume (B4).
+# Path is relative to the container WORKDIR (/workspace) unless absolute.
+# Compatible with replacing PHP signal/ ingest later: each line ends with
+# lowercase hex of framed bytes (same as bin2hex of the raw frame).
+# journal_path = "data/frames.journal"
+# Soft size cap (bytes); vacuum keeps trailing complete lines when exceeded.
+# journal_max_bytes = 10485760
+# Soft age cap (seconds); age trim is a stub (config accepted, no-op vacuum).
+# journal_max_age_secs = 604800

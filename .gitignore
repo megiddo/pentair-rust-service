@@ -19,3 +19,8 @@ default_*.profraw
 .env
 .env.*
 !.env.example
+
+# Runtime journal (bind-mounted data dir)
+/data/
+*.journal
+*.journal.tmp

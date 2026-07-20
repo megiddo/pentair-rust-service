@@ -1,13 +1,15 @@
 //! Library root for `pentairservice`.
 //!
 //! Pattern: **Facade** — this crate is the application façade over config, logging,
-//! framing, transport Actor, decode registry, in-memory state, and the local HTTP API.
+//! framing, transport Actor, decode registry, in-memory state, optional frame journal,
+//! and the local HTTP API.
 
 #![deny(missing_docs)]
 
 pub mod api;
 pub mod config;
 pub mod framer;
+pub mod journal;
 pub mod logging;
 pub mod messages;
 pub mod registry;
@@ -22,6 +24,9 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::journal::{
+    shared_file_journal, FileFrameJournal, RetentionPolicy, SharedIngest,
+};
 use crate::registry::MessageRegistry;
 use crate::state::{shared_bus_state, SharedBusState};
 use crate::transport::actor::{spawn_from_url, BusActorConfig};
@@ -44,11 +49,45 @@ pub fn log_transport_idle_state(config: &Config) {
     }
 }
 
+/// Opens the optional append-only frame journal from config.
+///
+/// Pattern: **Repository** factory — file log on the bind-mounted volume.
+fn open_journal_from_config(config: &Config) -> SharedIngest {
+    let Some(path) = config.journal_path.as_ref() else {
+        info!("frame journal disabled (no journal_path)");
+        return None;
+    };
+    let retention = RetentionPolicy {
+        max_bytes: config.journal_max_bytes,
+        max_age_secs: config.journal_max_age_secs,
+    };
+    match FileFrameJournal::open(path, retention) {
+        Ok(j) => {
+            info!(
+                path = %path.display(),
+                max_bytes = ?config.journal_max_bytes,
+                max_age_secs = ?config.journal_max_age_secs,
+                "frame journal open (Append-Only Log)"
+            );
+            shared_file_journal(j)
+        }
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to open frame journal; continuing without durable log"
+            );
+            None
+        }
+    }
+}
+
 /// Runs the service: optional bus Actor + local API until the listener fails.
 ///
 /// When `transport_url` is set, a **single** tokio task owns the socket/port,
 /// feeds the streaming framer, and reconnects with backoff — never open/close
-/// per frame. Framed output is decoded into the shared status snapshot.
+/// per frame. Framed output is decoded into the shared status snapshot and
+/// optionally appended to the frame journal.
 ///
 /// Pattern: **Facade** — single entry that composes config + transport Actor + API.
 pub async fn run(config: Config) -> Result<(), std::io::Error> {
@@ -60,8 +99,14 @@ pub async fn run(config: Config) -> Result<(), std::io::Error> {
     log_transport_idle_state(&config);
 
     let state = shared_bus_state();
+    let journal = open_journal_from_config(&config);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let bus = spawn_bus_if_configured(&config, shutdown_rx, std::sync::Arc::clone(&state));
+    let bus = spawn_bus_if_configured(
+        &config,
+        shutdown_rx,
+        std::sync::Arc::clone(&state),
+        journal,
+    );
 
     let app = build_router(std::sync::Arc::clone(&state));
     let listener = TcpListener::bind(addr).await?;
@@ -92,6 +137,7 @@ fn spawn_bus_if_configured(
     config: &Config,
     shutdown: watch::Receiver<bool>,
     state: SharedBusState,
+    journal: SharedIngest,
 ) -> Option<tokio::task::JoinHandle<crate::transport::BusStats>> {
     let url = config
         .transport_url
@@ -105,6 +151,7 @@ fn spawn_bus_if_configured(
         shutdown,
         state,
         MessageRegistry::with_defaults(),
+        journal,
     ) {
         Ok((handle, _counters)) => {
             info!(transport_url = %url, "bus Actor spawned");
@@ -152,6 +199,9 @@ mod tests {
             bind_addr: "127.0.0.1:0".into(),
             transport_url: Some("tcp://127.0.0.1:8899".into()),
             log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
         };
         log_transport_idle_state(&with_url);
 
@@ -159,6 +209,9 @@ mod tests {
             bind_addr: "127.0.0.1:0".into(),
             transport_url: Some("  ".into()),
             log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
         };
         log_transport_idle_state(&blank);
     }
@@ -169,6 +222,9 @@ mod tests {
             bind_addr: "not-a-socket".into(),
             transport_url: None,
             log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
         };
         let err = run(cfg).await.expect_err("invalid bind must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -184,6 +240,9 @@ mod tests {
             bind_addr: addr.to_string(),
             transport_url: None,
             log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
         };
 
         let handle = tokio::spawn(async move { run(cfg).await });
@@ -205,6 +264,9 @@ mod tests {
             bind_addr: addr.to_string(),
             transport_url: Some("replay:fixtures/status_temps.hex".into()),
             log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
         };
 
         let handle = tokio::spawn(async move { run(cfg).await });
@@ -231,15 +293,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_with_replay_writes_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal_path = dir.path().join("watch.journal");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let cfg = Config {
+            bind_addr: addr.to_string(),
+            transport_url: Some("replay:fixtures/status_temps.hex".into()),
+            log_level: "info".into(),
+            journal_path: Some(journal_path.clone()),
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
+        };
+
+        let handle = tokio::spawn(async move { run(cfg).await });
+
+        let mut saw_temps = false;
+        for _ in 0..100 {
+            if let Ok(body) = tiny_http_get(&format!("http://{addr}/status")).await {
+                if body.contains("\"tempStatus\"") && !body.contains("\"tempStatus\":null") {
+                    saw_temps = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw_temps);
+
+        // Allow journal flush from decode drain.
+        for _ in 0..50 {
+            if journal_path.is_file() {
+                if let Ok(recs) = crate::journal::FileFrameJournal::read_all(&journal_path) {
+                    if !recs.is_empty() {
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        handle.abort();
+        let _ = handle.await;
+
+        let records = crate::journal::FileFrameJournal::read_all(&journal_path).unwrap();
+        assert!(
+            !records.is_empty(),
+            "expected journal entries from replay watch session"
+        );
+        let raws = crate::journal::FileFrameJournal::replay_raw(&journal_path).unwrap();
+        assert_eq!(raws.len(), records.len());
+        assert!(!raws[0].is_empty());
+    }
+
+    #[tokio::test]
     async fn spawn_bus_invalid_url_still_ok() {
         let cfg = Config {
             bind_addr: "127.0.0.1:0".into(),
             transport_url: Some("http://not-supported".into()),
             log_level: "info".into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
         };
         let (_tx, rx) = watch::channel(false);
         let state = shared_bus_state();
-        assert!(spawn_bus_if_configured(&cfg, rx, state).is_none());
+        assert!(spawn_bus_if_configured(&cfg, rx, state, None).is_none());
     }
 
     #[test]
@@ -247,7 +368,30 @@ mod tests {
         let cfg = Config::default();
         let (_tx, rx) = watch::channel(false);
         let state = shared_bus_state();
-        assert!(spawn_bus_if_configured(&cfg, rx, state).is_none());
+        assert!(spawn_bus_if_configured(&cfg, rx, state, None).is_none());
+    }
+
+    #[test]
+    fn open_journal_none_without_path() {
+        let cfg = Config::default();
+        assert!(open_journal_from_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn open_journal_from_temp_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svc.journal");
+        let cfg = Config {
+            bind_addr: "127.0.0.1:0".into(),
+            transport_url: None,
+            log_level: "info".into(),
+            journal_path: Some(path.clone()),
+            journal_max_bytes: Some(1024),
+            journal_max_age_secs: Some(60),
+        };
+        let ingest = open_journal_from_config(&cfg);
+        assert!(ingest.is_some());
+        assert!(path.is_file());
     }
 
     async fn reqwest_get(addr: &SocketAddr, path: &str) -> String {

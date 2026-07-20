@@ -29,6 +29,15 @@ pub const ENV_BIND_ADDR: &str = "PENTAIR_BIND_ADDR";
 /// Environment variable for log level filter (also respects `RUST_LOG` at subscriber init).
 pub const ENV_LOG_LEVEL: &str = "PENTAIR_LOG_LEVEL";
 
+/// Environment variable for append-only frame journal path (mounted volume).
+pub const ENV_JOURNAL_PATH: &str = "PENTAIR_JOURNAL_PATH";
+
+/// Environment variable for journal max size in bytes (retention stub).
+pub const ENV_JOURNAL_MAX_BYTES: &str = "PENTAIR_JOURNAL_MAX_BYTES";
+
+/// Environment variable for journal max age in seconds (retention stub).
+pub const ENV_JOURNAL_MAX_AGE_SECS: &str = "PENTAIR_JOURNAL_MAX_AGE_SECS";
+
 /// Errors while loading or validating configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -47,6 +56,9 @@ pub enum ConfigError {
     /// Bind address is empty after resolution.
     #[error("bind_addr must not be empty")]
     EmptyBindAddr,
+    /// Journal retention numeric env/file value is not a valid integer.
+    #[error("invalid journal retention number: {0}")]
+    BadJournalNumber(String),
 }
 
 /// Immutable runtime settings for the service.
@@ -60,6 +72,12 @@ pub struct Config {
     pub transport_url: Option<String>,
     /// Default tracing filter directive (e.g. `info`, `debug`).
     pub log_level: String,
+    /// Optional append-only frame journal path (e.g. `data/frames.journal` on the bind mount).
+    pub journal_path: Option<PathBuf>,
+    /// Soft max journal file size in bytes (retention stub); `None` = unbounded.
+    pub journal_max_bytes: Option<u64>,
+    /// Soft max journal age in seconds (retention stub / no-op age trim); `None` = unbounded.
+    pub journal_max_age_secs: Option<u64>,
 }
 
 impl Default for Config {
@@ -68,6 +86,9 @@ impl Default for Config {
             bind_addr: DEFAULT_BIND_ADDR.to_string(),
             transport_url: None,
             log_level: DEFAULT_LOG_LEVEL.to_string(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
         }
     }
 }
@@ -91,6 +112,11 @@ impl Config {
             .as_ref()
             .is_some_and(|u| !u.trim().is_empty())
     }
+
+    /// Returns true when a journal path is configured.
+    pub fn has_journal(&self) -> bool {
+        self.journal_path.is_some()
+    }
 }
 
 /// Accumulates partial settings before producing a [`Config`].
@@ -101,6 +127,9 @@ pub struct ConfigBuilder {
     bind_addr: Option<String>,
     transport_url: Option<Option<String>>,
     log_level: Option<String>,
+    journal_path: Option<Option<PathBuf>>,
+    journal_max_bytes: Option<Option<u64>>,
+    journal_max_age_secs: Option<Option<u64>>,
 }
 
 impl ConfigBuilder {
@@ -138,6 +167,35 @@ impl ConfigBuilder {
         self
     }
 
+    /// Sets the frame journal path. Empty string clears (journal disabled).
+    pub fn journal_path(mut self, path: impl Into<String>) -> Self {
+        let s = path.into();
+        self.journal_path = Some(if s.trim().is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(s))
+        });
+        self
+    }
+
+    /// Clears the journal path.
+    pub fn clear_journal(mut self) -> Self {
+        self.journal_path = Some(None);
+        self
+    }
+
+    /// Sets soft max journal bytes (`None` clears).
+    pub fn journal_max_bytes(mut self, max: Option<u64>) -> Self {
+        self.journal_max_bytes = Some(max);
+        self
+    }
+
+    /// Sets soft max journal age in seconds (`None` clears).
+    pub fn journal_max_age_secs(mut self, max: Option<u64>) -> Self {
+        self.journal_max_age_secs = Some(max);
+        self
+    }
+
     /// Merges values from a TOML file (missing keys leave prior builder state).
     pub fn merge_file(mut self, path: &Path) -> Result<Self, ConfigError> {
         let raw = fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -153,6 +211,15 @@ impl ConfigBuilder {
         }
         if let Some(level) = file.log_level {
             self.log_level = Some(level);
+        }
+        if let Some(jp) = file.journal_path {
+            self = self.journal_path(jp);
+        }
+        if let Some(n) = file.journal_max_bytes {
+            self.journal_max_bytes = Some(Some(n));
+        }
+        if let Some(n) = file.journal_max_age_secs {
+            self.journal_max_age_secs = Some(Some(n));
         }
         Ok(self)
     }
@@ -178,6 +245,29 @@ impl ConfigBuilder {
                 builder = builder.log_level(level);
             }
         }
+        if let Ok(path) = env::var(ENV_JOURNAL_PATH) {
+            builder = builder.journal_path(path);
+        }
+        if let Ok(raw) = env::var(ENV_JOURNAL_MAX_BYTES) {
+            if raw.trim().is_empty() {
+                builder = builder.journal_max_bytes(None);
+            } else {
+                let n: u64 = raw.trim().parse().map_err(|_| {
+                    ConfigError::BadJournalNumber(format!("{ENV_JOURNAL_MAX_BYTES}={raw}"))
+                })?;
+                builder = builder.journal_max_bytes(Some(n));
+            }
+        }
+        if let Ok(raw) = env::var(ENV_JOURNAL_MAX_AGE_SECS) {
+            if raw.trim().is_empty() {
+                builder = builder.journal_max_age_secs(None);
+            } else {
+                let n: u64 = raw.trim().parse().map_err(|_| {
+                    ConfigError::BadJournalNumber(format!("{ENV_JOURNAL_MAX_AGE_SECS}={raw}"))
+                })?;
+                builder = builder.journal_max_age_secs(Some(n));
+            }
+        }
 
         Ok(builder)
     }
@@ -194,11 +284,17 @@ impl ConfigBuilder {
             .log_level
             .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_string());
         let transport_url = self.transport_url.unwrap_or(None);
+        let journal_path = self.journal_path.unwrap_or(None);
+        let journal_max_bytes = self.journal_max_bytes.unwrap_or(None);
+        let journal_max_age_secs = self.journal_max_age_secs.unwrap_or(None);
 
         Ok(Config {
             bind_addr,
             transport_url,
             log_level,
+            journal_path,
+            journal_max_bytes,
+            journal_max_age_secs,
         })
     }
 }
@@ -209,6 +305,9 @@ struct FileConfig {
     bind_addr: Option<String>,
     transport_url: Option<String>,
     log_level: Option<String>,
+    journal_path: Option<String>,
+    journal_max_bytes: Option<u64>,
+    journal_max_age_secs: Option<u64>,
 }
 
 /// Resolves config file path: `PENTAIR_CONFIG` if set, else `./config.toml` when it exists.
@@ -401,8 +500,12 @@ log_level = "error"
             bind_addr: DEFAULT_BIND_ADDR.into(),
             transport_url: Some("  ".into()),
             log_level: DEFAULT_LOG_LEVEL.into(),
+            journal_path: None,
+            journal_max_bytes: None,
+            journal_max_age_secs: None,
         };
         assert!(!cfg.has_transport());
+        assert!(!cfg.has_journal());
     }
 
     #[test]
@@ -443,12 +546,94 @@ log_level = "error"
     }
 
     #[test]
+    fn merge_file_journal_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.toml");
+        fs::write(
+            &path,
+            r#"
+journal_path = "data/frames.journal"
+journal_max_bytes = 1048576
+journal_max_age_secs = 86400
+"#,
+        )
+        .unwrap();
+        let cfg = ConfigBuilder::new().merge_file(&path).unwrap().build().unwrap();
+        assert_eq!(
+            cfg.journal_path.as_deref(),
+            Some(Path::new("data/frames.journal"))
+        );
+        assert_eq!(cfg.journal_max_bytes, Some(1_048_576));
+        assert_eq!(cfg.journal_max_age_secs, Some(86_400));
+        assert!(cfg.has_journal());
+    }
+
+    #[test]
+    fn journal_builder_clear_and_env() {
+        let _lock = env_lock().lock().unwrap();
+        let cfg = ConfigBuilder::new()
+            .journal_path("data/a.journal")
+            .clear_journal()
+            .journal_max_bytes(Some(99))
+            .journal_max_age_secs(Some(12))
+            .build()
+            .unwrap();
+        assert!(!cfg.has_journal());
+        assert_eq!(cfg.journal_max_bytes, Some(99));
+        assert_eq!(cfg.journal_max_age_secs, Some(12));
+
+        let dir = tempfile::tempdir().unwrap();
+        let jpath = dir.path().join("from-env.journal");
+        let _g1 = EnvGuard::unset(ENV_CONFIG_PATH);
+        let _g2 = EnvGuard::set(ENV_JOURNAL_PATH, jpath.to_str().unwrap());
+        let _g3 = EnvGuard::set(ENV_JOURNAL_MAX_BYTES, "4096");
+        let _g4 = EnvGuard::set(ENV_JOURNAL_MAX_AGE_SECS, "120");
+        let _g5 = EnvGuard::unset(ENV_BIND_ADDR);
+        let _g6 = EnvGuard::unset(ENV_TRANSPORT_URL);
+        let _g7 = EnvGuard::unset(ENV_LOG_LEVEL);
+
+        let loaded = ConfigBuilder::new().from_env_and_disk().unwrap().build().unwrap();
+        assert_eq!(loaded.journal_path.as_deref(), Some(jpath.as_path()));
+        assert_eq!(loaded.journal_max_bytes, Some(4096));
+        assert_eq!(loaded.journal_max_age_secs, Some(120));
+    }
+
+    #[test]
+    fn journal_env_empty_clears_and_bad_number() {
+        let _lock = env_lock().lock().unwrap();
+        let _g1 = EnvGuard::unset(ENV_CONFIG_PATH);
+        let _g2 = EnvGuard::set(ENV_JOURNAL_PATH, "data/x.journal");
+        let _g3 = EnvGuard::set(ENV_JOURNAL_MAX_BYTES, "");
+        let _g4 = EnvGuard::set(ENV_JOURNAL_MAX_AGE_SECS, "");
+        let _g5 = EnvGuard::unset(ENV_BIND_ADDR);
+        let _g6 = EnvGuard::unset(ENV_TRANSPORT_URL);
+        let _g7 = EnvGuard::unset(ENV_LOG_LEVEL);
+
+        let cfg = ConfigBuilder::new().from_env_and_disk().unwrap().build().unwrap();
+        assert!(cfg.has_journal());
+        assert_eq!(cfg.journal_max_bytes, None);
+        assert_eq!(cfg.journal_max_age_secs, None);
+
+        let _g3b = EnvGuard::set(ENV_JOURNAL_MAX_BYTES, "nope");
+        let err = ConfigBuilder::new().from_env_and_disk().unwrap_err();
+        assert!(matches!(err, ConfigError::BadJournalNumber(_)));
+
+        let _g3c = EnvGuard::set(ENV_JOURNAL_MAX_BYTES, "10");
+        let _g4b = EnvGuard::set(ENV_JOURNAL_MAX_AGE_SECS, "bad");
+        let err2 = ConfigBuilder::new().from_env_and_disk().unwrap_err();
+        assert!(matches!(err2, ConfigError::BadJournalNumber(_)));
+    }
+
+    #[test]
     fn empty_env_bind_ignored() {
         let _lock = env_lock().lock().unwrap();
         let _g1 = EnvGuard::unset(ENV_CONFIG_PATH);
         let _g2 = EnvGuard::set(ENV_BIND_ADDR, "");
         let _g3 = EnvGuard::unset(ENV_TRANSPORT_URL);
         let _g4 = EnvGuard::unset(ENV_LOG_LEVEL);
+        let _g5 = EnvGuard::unset(ENV_JOURNAL_PATH);
+        let _g6 = EnvGuard::unset(ENV_JOURNAL_MAX_BYTES);
+        let _g7 = EnvGuard::unset(ENV_JOURNAL_MAX_AGE_SECS);
 
         let cfg = ConfigBuilder::new().from_env_and_disk().unwrap().build().unwrap();
         // If a local config.toml exists it may override; bind from empty env must not.
@@ -464,5 +649,7 @@ log_level = "error"
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "nope"),
         };
         assert!(io.to_string().contains("/x"));
+        let bad = ConfigError::BadJournalNumber("x".into());
+        assert!(bad.to_string().contains("journal"));
     }
 }

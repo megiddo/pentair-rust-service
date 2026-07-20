@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 use crate::framer::{Frame, Framer};
+use crate::journal::SharedIngest;
 use crate::registry::MessageRegistry;
 use crate::state::{spawn_decode_drain, SharedBusState};
 
@@ -352,18 +353,22 @@ pub fn spawn_frame_drain(mut rx: mpsc::Receiver<Frame>) -> tokio::task::JoinHand
 }
 
 /// Convenience: build actor from URL, decode into shared state, spawn Actor.
+///
+/// Optional `journal` receives every framed message (Append-Only Log / future
+/// `signal/` ingest hook) before decode updates the snapshot.
 pub fn spawn_from_url(
     url: &str,
     config: BusActorConfig,
     shutdown: watch::Receiver<bool>,
     state: SharedBusState,
     registry: MessageRegistry,
+    journal: SharedIngest,
 ) -> Result<(tokio::task::JoinHandle<BusStats>, Arc<BusCounters>), TransportError> {
     let transport = super::from_url(url)?;
     let actor = BusActor::new(transport, config);
     let counters = actor.counters();
     let (tx, rx) = mpsc::channel(256);
-    let _drain = spawn_decode_drain(rx, state, registry);
+    let _drain = spawn_decode_drain(rx, state, registry, journal);
     let handle = actor.spawn(tx, shutdown);
     Ok((handle, counters))
 }
@@ -676,6 +681,7 @@ mod tests {
             shutdown_rx,
             Arc::clone(&state),
             MessageRegistry::with_defaults(),
+            None,
         )
         .unwrap();
         assert!(

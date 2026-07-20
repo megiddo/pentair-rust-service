@@ -64,10 +64,26 @@ docker run --rm -it -v "$PWD":/workspace -w /workspace -p 8080:8080 pentairservi
 
 | Source | Keys |
 |--------|------|
-| Env | `PENTAIR_BIND_ADDR`, `PENTAIR_TRANSPORT_URL`, `PENTAIR_LOG_LEVEL`, `PENTAIR_CONFIG` |
-| TOML | `bind_addr`, `transport_url`, `log_level` (see `config.example.toml`) |
+| Env | `PENTAIR_BIND_ADDR`, `PENTAIR_TRANSPORT_URL`, `PENTAIR_LOG_LEVEL`, `PENTAIR_CONFIG`, `PENTAIR_JOURNAL_PATH`, `PENTAIR_JOURNAL_MAX_BYTES`, `PENTAIR_JOURNAL_MAX_AGE_SECS` |
+| TOML | `bind_addr`, `transport_url`, `log_level`, `journal_path`, `journal_max_bytes`, `journal_max_age_secs` (see `config.example.toml`) |
 
-Defaults: bind `0.0.0.0:8080`, no transport. With an empty/unset `transport_url`, the service **idles** and serves `GET /health` / `/status` / `/frames` without opening TCP/serial.
+Defaults: bind `0.0.0.0:8080`, no transport, no journal. With an empty/unset `transport_url`, the service **idles** and serves `GET /health` / `/status` / `/frames` without opening TCP/serial.
+
+### Frame journal (B4)
+
+Optional **append-only** log of framed bus messages on the bind-mounted volume (e.g. `data/frames.journal` under `/workspace`).
+
+```bash
+docker compose run --rm --service-ports \
+  -e PENTAIR_TRANSPORT_URL=replay:fixtures/status_temps.hex \
+  -e PENTAIR_JOURNAL_PATH=data/frames.journal \
+  pentairservice-dev cargo run
+```
+
+- Format: comment header + TSV lines `ts_ms\tchecksum_ok\tkind\thex` (final column = lowercase hex, same as PHP `signal/` `bin2hex`).
+- Pattern: **Repository** / **Append-Only Log**; trait `FrameIngest` is the hook for a future HTTP/MySQL sink replacing `signal/` ingest.
+- Retention stub: `journal_max_bytes` trims trailing lines when over size; `journal_max_age_secs` is accepted but age vacuum is a no-op stub.
+- Offline replay: unit tests read the journal back via `FileFrameJournal::replay_raw`.
 
 ### HTTP API (B3)
 
@@ -145,6 +161,7 @@ docker compose run --rm --network=host \
 | `src/messages.rs` | SystemStatus / TempStatus / Unknown DTOs | Command / Message |
 | `src/registry.rs` | cmd-byte → parser map | Factory |
 | `src/state.rs` | Latest snapshot + frames ring | Facade (shared state) |
+| `src/journal.rs` | Append-only frame log + `FrameIngest` hook | Repository / Append-Only Log |
 | `src/transport/` | TCP / serial / replay + reconnect Actor | Strategy + Actor |
 | `src/logging.rs` | Tracing subscriber init | Facade |
 | `src/api/` | Local HTTP surface | Facade |
@@ -154,4 +171,4 @@ docker compose run --rm --network=host \
 
 ## Milestone
 
-Track B **B3** decode + status snapshot API (on B2 transport).
+Track B **B4** append-only frame journal (on B3 status API).

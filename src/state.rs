@@ -190,16 +190,23 @@ impl FrameEntry {
 
 /// Spawns a task that decodes Actor frames into [`SharedBusState`].
 ///
-/// Pattern: bridges **Actor** framed output → **Factory/registry** → state.
+/// When `journal` is set, each framed message is also appended to the
+/// **Append-Only Log** (Repository) before decode — same hook shape as a future
+/// `signal/` HTTP/MySQL ingest.
+///
+/// Pattern: bridges **Actor** framed output → optional **Repository** journal →
+/// **Factory/registry** → state.
 pub fn spawn_decode_drain(
     mut rx: mpsc::Receiver<Frame>,
     state: SharedBusState,
     registry: MessageRegistry,
+    journal: crate::journal::SharedIngest,
 ) -> tokio::task::JoinHandle<u64> {
     tokio::spawn(async move {
         let mut n = 0u64;
         while let Some(frame) = rx.recv().await {
             n += 1;
+            crate::journal::append_frame_best_effort(&journal, &frame);
             let kind = frame.kind;
             let checksum_ok = frame.checksum_ok;
             let outcome = registry.decode_frame(&frame);
@@ -287,7 +294,12 @@ mod tests {
     async fn decode_drain_updates_shared_state() {
         let state = shared_bus_state();
         let (tx, rx) = mpsc::channel(8);
-        let h = spawn_decode_drain(rx, Arc::clone(&state), MessageRegistry::with_defaults());
+        let h = spawn_decode_drain(
+            rx,
+            Arc::clone(&state),
+            MessageRegistry::with_defaults(),
+            None,
+        );
         tx.send(Frame {
             kind: FrameKind::A5,
             raw: hx(INFO),
@@ -299,6 +311,40 @@ mod tests {
         assert_eq!(h.await.unwrap(), 1);
         let guard = state.read().await;
         assert!(guard.temp_status.is_some());
+    }
+
+    #[tokio::test]
+    async fn decode_drain_appends_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drain.journal");
+        let journal = crate::journal::FileFrameJournal::open(
+            &path,
+            crate::journal::RetentionPolicy::none(),
+        )
+        .unwrap();
+        let shared = crate::journal::shared_file_journal(journal);
+
+        let state = shared_bus_state();
+        let (tx, rx) = mpsc::channel(8);
+        let h = spawn_decode_drain(
+            rx,
+            Arc::clone(&state),
+            MessageRegistry::with_defaults(),
+            shared,
+        );
+        tx.send(Frame {
+            kind: FrameKind::A5,
+            raw: hx(INFO),
+            checksum_ok: true,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        assert_eq!(h.await.unwrap(), 1);
+
+        let records = crate::journal::FileFrameJournal::read_all(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].raw_bytes().unwrap(), hx(INFO));
     }
 
     #[test]
